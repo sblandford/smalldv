@@ -1,0 +1,1266 @@
+#!/usr/bin/env python
+#
+#   smalldv
+#
+#   Embedded FreeDV control shell around fdvcore
+#
+#   Copyright (C) 2018 by Matt Roberts.
+#   License: GNU GPL3 (www.gnu.org)
+#
+#   Project started: 2018-05-06
+#
+#
+
+#
+#  CONFIG: define some config constants; make these configurable later
+#
+
+# the name of the PCM device
+PCMdevice = "USB Audio Device"
+
+# ALSA channel names (name, quote*)
+mixer_mic = ( "Mic Capture Volume", False)
+mixer_phones = ( "Speaker Playback Volume", False)
+#     ...
+# (*) The 'quote' field is for channel names that have to be quoted
+#     when modified via the standard ALSA mixer tools.  These tools
+#     are apparently very broken for some channel types/names, and
+#     those names have to be quoted as a single token when addressed
+#     by these tools.
+
+# the TCP port where clients are serviced
+TCPPort = 5445
+
+# the path to the INI file where settings are stored
+config_path = "~/.config/smalldv.ini"
+
+# how often to interrupt the main 'select' loop to poll the fdvcore for stats, health, etc.
+state_poll_delay = 0.15
+
+# list of thresholds (must be four) for DF LED state
+df_table = (-75, -15, 15, 75)
+
+#
+#  GPIO: hardware pin assignments for RasPi
+#
+
+# this is the input line for PTT
+PTT_IN_PIN = 23
+
+# this is the output for PTT
+PTT_OUT_PIN = 24
+
+# this is the "clipping" warning LED output
+CLIP_LED_PIN = 25
+
+# this is the "sync" confirmation LED
+SYNC_LED_PIN = 12
+
+# this is the set of frequency offset LEDs
+DF_LEDS = (16, 20, 21)
+
+# number of seconds to light each LED on startup
+LED_SETUP_DELAY = 0.15
+
+
+#
+#  Hardware states: use these to change the polarity of GPIO hardware pins
+#
+
+# PTT input states (use TX = False for active-low button)
+PTT_IN_TX = False
+PTT_IN_RX = not PTT_IN_TX
+
+# PTT output states (use TX = True to drive n-channel FET or NPN BJT)
+PTT_OUT_TX = True
+PTT_OUT_RX = not PTT_OUT_TX
+
+# CLIP LED output states (use ON = True to drive grounded LED)
+CLIP_LED_ON = True
+CLIP_LED_OFF = not CLIP_LED_ON
+
+# SYNC LED output states (use ON = True to drive grounded LED)
+SYNC_LED_ON = True
+SYNC_LED_OFF = not SYNC_LED_ON
+
+# DF LED output states (use ON = True to drive grounded LED)
+DF_LED_ON = True
+DF_LED_OFF = not DF_LED_ON
+
+
+#
+#  END CONFIGURATION OPTIONS
+#
+
+# system modules
+import sys
+import os.path
+import time
+import socket
+import select
+import string
+import signal
+import subprocess
+import thread
+import ConfigParser
+
+# import GPIO support on RasPi
+try:
+	from RPi import GPIO
+
+	# default to CPU names
+	SMALLDV_GPIO_CONVENTION = GPIO.BCM
+
+except:
+	GPIO = None
+	sys.stderr.write("WARNING: RasPi GPIO library not found; hardware PTT unavailable\n")
+
+# the FreeDV modem to use
+DVmodem = "1600"
+
+# the 'fdvcore' object - set to non-None when fdvcore running
+fdvcore = None
+
+# reference to 'amixer' process - set to non-None when 'amixer' is running
+amixer = None
+
+# the TCP listener
+listener = None
+
+# the list of active TCP clients
+clients = [ ]
+
+# a mutex for protecting critical sections shared between the main loop and client threads
+mutex = None
+
+# global shutdown flag
+shutdown = False
+
+# the alsa device numbers
+alsa_dev = None
+
+# the RtAudio device numbers
+rt_dev = None
+
+# volume collection
+class fdv_volume:
+	def __init__(self):
+		self.radio_tx = 100
+		self.radio_rx = 100
+		self.phones = 100
+		self.mic = 100
+
+# the global volume collection
+volume = fdv_volume()
+
+# global TX flag
+is_tx = False
+
+# background flag
+is_background = False
+
+# indicates that the modem is synchronized
+is_sync = False
+
+# flag for disabling core checks (during e.g. restarts)
+disable_fdvcore_checks = False
+
+# the path to the 'fdvcore' program
+fdvcore_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fdvcore")
+
+# state polling
+last_poll_time = 0.0
+last_poll_code = 0
+
+
+#
+#  start_amixer()
+#
+#  Call 'amixer' to set a volume item
+#
+def start_amixer():
+	global amixer
+	global alsa_dev
+
+	# call the process...
+	args = [ "amixer", "-c", str(alsa_dev[0]), "-s" ]
+	if not is_background:
+		sys.stderr.write("DEBUG: start_amixer(%s)\n" % (string.join(args)))
+	try:
+		amixer = subprocess.Popen(
+			args,
+			shell=False,
+			stdin=subprocess.PIPE,
+			stdout=open(os.devnull, 'w'),
+			stderr=open(os.devnull, 'w'),
+			bufsize=256,
+			close_fds=True)
+		return True
+	except Exception, e:
+		if not is_background:
+			sys.stderr.write("DEBUG: %s: %s\n", str(type(e)), e)
+		return False
+
+
+#
+#  check_amixer()
+#
+#  Return True if the process is still running; otherwise return False
+#
+def check_amixer():
+	global amixer
+	if not amixer:
+		return False
+	status = amixer.poll()
+	if status is None:
+		return True
+	return False
+
+
+#
+#  stop_amixer()
+#
+#  Stop 'amixer' child process
+#
+def stop_amixer():
+	global amixer
+	if not amixer:
+		return False
+	try:
+		amixer.stdin.close()
+		amixer.wait()
+	except:
+		pass
+
+
+#
+#  amixer_set(...)
+#
+#  Adjust a mixer item.
+#
+def amixer_set(item, value, quote = False):
+	global amixer
+	if not amixer:
+		return False
+	quotes = ''
+	if quote:
+		quotes = '\''
+	try:
+		cmd = "set %s%s%s %s\n" % (quotes, item, quotes, value)
+		amixer.stdin.write(cmd)
+		amixer.stdin.flush()
+	except Exception, e:
+		if not is_background:
+			sys.stderr.write("DEBUG: %s: %s\n" % (str(type(e)), e))
+		return False
+	return True
+
+
+#
+#  send_command(...)
+#
+#  Send a command to the 'fdvcore' child process.
+#
+def send_command(s):
+	global fdvcore
+	try:
+		# trim unneeded whitespace
+		s = s.strip()
+		# lock the mutex
+		mutex.acquire()
+		# write the command
+		fdvcore.stdin.write(s)
+		fdvcore.stdin.write('\n')
+		fdvcore.stdin.flush()
+		# pass back whatever was returned
+		return fdvcore.stdout.readline()
+	except:
+		return ""
+	finally:
+		mutex.release()
+
+#
+#  start_fdvcore(dev)
+#
+#  Start 'fdvcore' as a child process, and redirect its std I/O to pipes.
+#
+def start_fdvcore(dev):
+	global fdvcore
+	global fdvcore_path
+	global DVmodem
+
+	if not is_background:
+		sys.stderr.write("DEBUG: start_fdvcore(%s %s %s)\n" % (fdvcore_path, dev, DVmodem))
+	if fdvcore:
+		if not is_background:
+			sys.stderr.write("WARNING: fdvcore is already running\n")
+		return False
+	if not type(dev) is str: 
+		dev = str(dev)
+	try:
+		fdvcore = subprocess.Popen(
+			(fdvcore_path, dev, DVmodem),
+			shell=False,
+			bufsize=256,
+			stdin=subprocess.PIPE,
+			stdout=subprocess.PIPE,
+			stderr=open(os.devnull, 'w'), # comment out to see fdvcore debugging info
+			close_fds=True)
+		return True
+	except Exception, e:
+		if not is_background:
+			sys.stderr.write("DEBUG: start_fdvcore(...) failed: %s\n" % (e))
+		fdvcore = None
+		return False
+
+
+#
+#  check_fdvcore()
+#
+#  Return True if the process is still running; otherwise return False
+#
+def check_fdvcore():
+	global fdvcore
+	if not fdvcore:
+		return False
+	status = fdvcore.poll()
+	if status is None:
+		return True
+	return False
+
+
+#
+#  stop_fdvcore()
+#
+#  Stop the 'fdvcore' child process.
+#
+def stop_fdvcore():
+	global fdvcore
+	if not fdvcore:
+		return False
+
+	# update config file before quitting
+	try:
+		# read modem config
+		config = read_modem_config()
+
+		# write to file
+		if config:
+			write_config_file(config)
+	except:
+		pass
+
+	# then shut down the modem
+	try:
+		# tell the modem to stop
+		send_command("QUIT")
+	except:
+		pass
+	try:
+		# wait for it to do so
+		fdvcore.wait()
+	except:
+		pass
+
+	fdvcore = None
+	return True
+
+
+#
+#  Call 'aplay -l' and return the result as a list of strings
+#
+def aplay_list():
+	p = subprocess.Popen(
+		("aplay", "-l"),
+		shell = False,
+		bufsize = 256,
+		stdout = subprocess.PIPE,
+		close_fds = True)
+	return p.stdout.readlines()
+
+
+#
+#  Call 'fdvcore' and return the result as a list of strings
+#
+def fdvcore_list():
+	global fdvcore_path
+	try:
+		p = subprocess.Popen(
+			(fdvcore_path, '-l'),
+			shell = False,
+			bufsize = 256,
+			stdout = subprocess.PIPE,
+			stderr = subprocess.PIPE,
+			close_fds = True)
+		p.stderr.readlines()
+		return p.stdout.readlines()
+	except:
+		return None
+
+
+#
+#  Search for the named device and return [ card, dev, subdevice_count ]
+#
+def GetALSADeviceNumbers(name):
+	result = None
+	try:
+		for line in aplay_list():
+			card = 0
+			dev = 0
+			if line.find('card ') == 0:
+				# new card
+				end_idx = line.find(':')
+				card = int(line[5:end_idx])
+				line = line[end_idx + 1 : ]
+				idx = line.find('device ')
+				if idx >= 0:
+					end_idx = line.find(':')
+					dev = int(line[idx + 7:end_idx])
+				idx = line.find('[')
+				end_idx = line.find(']')
+				card_name = line[idx + 1 : end_idx]
+				if name == card_name:
+					result = [ card, dev ]
+			elif result and line.find('Subdevices: ') >= 0:
+				parts = line.split(':')
+				if len(parts) == 2:
+					parts = parts[1].split('/')
+					return result + [ int(parts[0]) ]
+	except:
+		pass
+	return None
+
+
+#
+#  GetRTDeviceNumber(name) - return the RT device numbers associated with 'name'
+#
+def GetRTDeviceNumber(name):
+	if not name:
+		return -1
+	try:
+		lines = fdvcore_list()
+		if lines is None:
+			return -1
+		for line in lines:
+			key = 'Device ID = '
+			idx = line.find(key)
+			if idx >= 0:
+				parts = line.split(':', 1)
+				if len(parts) >= 2:
+					card_id = int(parts[0][idx + len(key) : ])
+					dev_str = parts[1].split('"')[1]
+					if dev_str.find(name) > 0:
+						dev_id = int(dev_str.split(',')[1])
+						return (card_id, dev_id)
+	except:
+		return None
+
+
+#
+#  split_command(...)
+#
+#  Split a command string into command and argument pair.
+#
+def split_command(cmd):
+	parts = cmd.split('=', 1)
+	if len(parts) == 1:
+		return [ parts[0].strip(), "" ]
+	return [ parts[0].strip(), parts[1].strip() ]
+
+
+#
+#  read_modem_config()
+#
+#  Read settings out of the 'fdvcore' child process.
+#
+def read_modem_config():
+	try:
+		version = send_command("VERSION").strip()
+		cmd, version = split_command(version)
+
+		if not version:
+			return None
+
+		sqen = send_command("SQEN").strip()
+		cmd, sqen = split_command(sqen)
+
+		sqth = send_command("SQTH").strip()
+		cmd, sqth = split_command(sqth)
+
+		text = send_command("TEXT").strip()
+		cmd, text = split_command(text)
+
+		return {
+			'Version': version,
+			'SquelchEnable' : sqen,
+			'SquelchSNR' : sqth,
+			'Text' : text,
+			'Volume_Radio_TX' : volume.radio_tx,
+			'Volume_Radio_RX' : volume.radio_rx,
+			'Volume_Phones' : volume.phones,
+			'Volume_Mic' : volume.mic,
+			'Modem' : DVmodem
+		}
+	except:
+		return None
+	
+
+#
+#  write_modem_config()
+#
+#  Write settings to the 'fdvcore' child process.
+#
+def write_modem_config(config):
+	try:
+		send_command("SQTH=%s" % config['squelchsnr'])
+		send_command("SQEN=%s" % config['squelchenable'])
+		send_command("TEXT=%s" % config['text'])
+		volume.radio_tx = int(config['volume_radio_tx'])
+		volume.radio_rx = int(config['volume_radio_rx'])
+		volume.phones = int(config['volume_phones'])
+		volume.mic = int(config['volume_mic'])
+		update_volume()
+		return True
+	except Exception, ex:
+		if not is_background:
+			sys.stderr.write("DEBUG: write_modem_config(...): " + str(ex) + "\n")
+		return False
+
+
+#
+#  lower_dict() - lowercase the keys in a dictionary
+#
+def lower_dict(config):
+	result = { }
+	for i in config.keys():
+		result[i.lower()] = config[i]
+	return result
+
+
+#
+#  read_config_file()
+#
+#  Read persisted configuration from an INI file.
+#
+def read_config_file():
+	global config_path
+	try:
+		# expand ~ in the config path
+		fn = os.path.expanduser(config_path)
+		# extract the folder name from the result
+		dn = os.path.dirname(fn)
+
+		# make the config folder if it doesn't exist
+		if not os.path.isdir(dn):
+			try:
+				os.mkdir(dn)
+				if not is_background:
+					sys.stderr.write("Created missing configuration folder: %s\n" % dn)
+			except:
+				if not is_background:
+					sys.stderr.write("Configuration folder %s did not exist, and could not create it.\n" % dn)
+			finally:
+				return None
+				
+		# read the config file
+		config = ConfigParser.ConfigParser()
+		config.read(fn)
+		result = { }
+		for pair in config.items('Modem'):
+			result[pair[0]] = pair[1]
+		return result
+	except Exception, ex:
+		if not is_background:
+			sys.stderr.write("read_config_file: " + str(ex) + "\n")
+		return None
+
+
+#
+#  write_config_file()
+#
+#  Write persistent configuration information to INI file.
+#
+def write_config_file(data):
+	global config_path
+	if not data:
+		if not is_background:
+			sys.stderr.write("Configuration not updated because supplied configuration was empty\n")
+			return False
+	try:
+		fn = os.path.expanduser(config_path)
+		config = ConfigParser.ConfigParser()
+		section = 'Modem'
+		config.add_section(section)
+		for key in data.keys():
+			config.set(section, key, data[key])
+		with open(fn, 'w') as configfile:
+			config.write(configfile)
+		return True
+	except Exception, ex:
+		if not is_background:
+			sys.stderr.write("write_config_file: " + str(ex) + "\n")
+		return False
+
+
+#
+#  stop_server()
+#
+#  Shut down the TCP server.
+#
+def stop_server():
+	global listener
+	if listener:
+		l = listener
+		listener = None
+		try:
+			l.shutdown(socket.SHUT_RDWR)
+		except:
+			pass
+		try:
+			l.close()
+		except:
+			pass
+
+
+#
+#  client_close(...)
+#
+#  Safely close a client socket.
+#
+def client_close(client):
+	if client:
+		try:
+			client.shutdown(socket.SHUT_RDWR)
+		except:
+			pass
+		try:
+			client.close()
+		except:
+			pass
+
+
+#
+#  client_thread(...)
+#
+#  The client thread method; this is called once per client on an independent thread.
+#
+def client_thread(client, addr):
+	global clients
+	global mutex
+	global shutdown
+	global DVmodem
+	global disable_fdvcore_checks
+
+	# buffer for incoming data from the socket
+	rx_buffer = ""
+	# buffer for outgoing data to the socket
+	tx_buffer = ""
+	tx_ok = False
+
+	try:
+		while True:
+			# assemble the fd sets
+			rset = [client]
+			wset = []
+			if not tx_ok:
+				wset.append(client)
+
+			# call select to wait for I/O
+			try:
+				(r, w, e) = select.select(rset, wset, []);
+			except select.error, ex:
+				if ex.args and ex.args[0] == 4:
+					continue # interrupted call is OK; just try again
+				break # otherwise, quit
+
+			# service READABLE event
+			if r:
+				# read data
+				data = client.recv(128)
+				# if EOF, quit
+				if data:
+					rx_buffer += data
+				else:
+					break
+				# look for EOL
+				idx = rx_buffer.find('\n')
+				# if there is a complete line...
+				if idx >= 0:
+					# extract the line from the rx_buffer, then split it into command and argument
+					cmd = rx_buffer[:idx].strip()
+					rx_buffer = rx_buffer[idx + 1:]
+					verb, arg = split_command(cmd)
+					verb = verb.upper()
+
+					# if client sent QUIT, disconnect
+					if verb == "QUIT":
+						break
+					# if client sent SHUTDOWN, exit cleanly
+					elif verb == "SHUTDOWN":
+						shutdown = True
+						break
+					# if client sent MODEM, toggle T/R
+					elif verb == "MODEM":
+						if arg:
+							arg = arg.upper()
+						if arg == '':
+							response = "OK:MODEM=" + str(DVmodem) + "\n"
+						elif arg == '1600' or arg == '700' or arg == '700B' or arg == '700C' or arg == '700D' or arg == '800XA':
+							response = "OK:MODEM=" + arg + "\n"
+							if arg != DVmodem:
+								if not is_background:
+									sys.stderr.write("DEBUG: switching to modem %s\n" % arg)
+
+								# go to RX mode
+								tx(False, True)
+
+								# read the current configuration
+								config = read_modem_config()
+								if config:
+									config = lower_dict(config)
+								else:
+									sys.stderr.write("WARNING: could not read modem config prior to restart\n")
+								disable_fdvcore_checks = True
+
+								# start the new modem
+								try:
+									stop_fdvcore()
+									time.sleep(0.5)
+									DVmodem = arg
+									if start_fdvcore(rt_dev[0]):
+										# force new modem into RX mode
+										tx(False, True)
+
+										# update the config
+										if config:
+											if not write_modem_config(config):
+												sys.stderr.write("WARNING: could not write modem config after restart\n")
+												
+								finally:
+									disable_fdvcore_checks = False
+						else:
+							response = "ERR\n"
+					# if client sent TX=..., toggle T/R
+					elif verb == "TX":
+						if not arg:
+							response = "OK:TX=%d\n" % int(is_tx)
+						elif arg == "1":
+							tx(True)
+							response = "OK:TX=1\n"
+						elif arg == "0":
+							tx(False)
+							response = "OK:TX=0\n"
+						else:
+							response = "ERR\n"
+					# volume commands
+					elif verb == "VOLRX" or verb == "VOLTX" or verb == "VOLPH" or verb == "VOLMIC":
+						if (arg):
+							if verb == "VOLRX":
+								volume.radio_rx = int(arg)
+							elif verb == "VOLTX":
+								volume.radio_tx = int(arg)
+							elif verb == "VOLPH":
+								volume.phones = int(arg)
+							elif verb == "VOLMIC":
+								volume.mic = int(arg)
+							update_volume()
+							response = cmd + '\n'
+						else:
+							response = "OK:%s=" % verb
+							if verb == "VOLRX":
+								response += str(volume.radio_rx)
+							elif verb == "VOLTX":
+								response += str(volume.radio_tx)
+							elif verb == "VOLPH":
+								response += str(volume.phones)
+							elif verb == "VOLMIC":
+								response += str(volume.mic)
+							response += '\n'
+					else:
+						# otherwise send the command to the modem, and get a response
+						response = send_command(cmd)
+
+					# whatever the response, send it to the client
+					if response:
+						if tx_buffer or not tx_ok:
+							tx_buffer += response
+						else:
+							client.send(response)
+							tx_ok = False
+
+					# if something changed, update persistent settings file
+					if cmd.find('=') > 0 and response.find("OK:") == 0:
+						config = None
+						try:
+							config = read_modem_config()
+						except:
+							if not is_background:
+								sys.stderr.write("WARNING: could not read config state\n")
+							
+						try:
+							mutex.acquire()
+							write_config_file(config)
+						except:
+							if not is_background:
+								sys.stderr.write("WARNING: could not update config state\n")
+						finally:
+							mutex.release()
+
+			# service WRITABLE event
+			if w:
+				if tx_buffer:
+					client.send(tx_buffer)
+				else:
+					tx_ok = True
+
+	except Exception as ex:
+		if not is_background:
+			sys.stderr.write("Client: %s\n" % ex)
+	
+	finally:
+		client_close(client)
+		try:
+			mutex.acquire()
+			clients.remove(client)
+		finally:
+			mutex.release()
+
+
+#
+#  tx(...)
+#
+#  Switch between TX and RX modes
+#
+def tx(yes, force = False):
+	global GPIO
+	global is_tx
+
+	# don't act if we're already there
+	if is_tx == yes and not force:
+		return True
+
+	# if we can't mute the modem, bail
+	if not send_command("MODE=MUTE"):
+		return False
+
+	# set the TX flag
+	is_tx = yes
+
+	# update the mixer volumes
+	update_volume()
+
+	# act
+	if yes: # TX
+		if GPIO:
+			GPIO.output(PTT_OUT_PIN, PTT_OUT_TX)
+			# mute the DF LEDs
+			for i in range(len(DF_LEDS)):
+				GPIO.output(DF_LEDS[i], DF_LED_OFF)
+		if send_command("MODE=TX"):
+			return True
+	else: # RX
+		if GPIO:
+			GPIO.output(PTT_OUT_PIN, PTT_OUT_RX)
+		if send_command("MODE=RX"):
+			return True
+
+	# DEBUG: explain failure
+	if not is_background:
+		sys.stderr.write("DEBUG: tx(%s) failed\n" % bool(yes))
+
+	# and fail
+	return False
+
+
+#
+#  update_volume()
+#
+#  Update the mixer to match the levels in the 'volume' object
+#
+def update_volume():
+	global volume
+	global is_tx
+	try:
+		if is_tx:
+			amixer_set(mixer_mic[0], str(volume.mic) + '%', mixer_mic[1])
+			amixer_set(mixer_phones[0], str(volume.radio_tx) + '%', mixer_phones[1])
+		else:
+			amixer_set(mixer_mic[0], str(volume.radio_rx) + '%', mixer_mic[1])
+			amixer_set(mixer_phones[0], str(volume.phones) + '%', mixer_phones[1])
+	except Exception, ex:
+		if not is_background:
+			sys.stderr.write("DEBUG: update_volume(): %s, %s\n" % (type(ex), ex))
+
+
+#
+#  mute_all()
+#
+#  Sets both input and output audio mixer volume to zero
+#
+def mute_all():
+	amixer_set(mixer_mic[0], '0%', mixer_mic[1])
+	amixer_set(mixer_phones[0], '0%', mixer_phones[1])
+
+
+#
+#  HandlePTT(...)
+#
+#  Interrupt handler for GPIO input pin change
+#
+def HandlePTT(pin):
+	global GPIO
+	if GPIO:
+		if pin == PTT_IN_PIN:
+			state = GPIO.input(PTT_IN_PIN)
+			tx(state == PTT_IN_TX)
+
+
+#
+#  process_df(...)
+#
+#  Change frequency offset LEDs to reflect new value
+#
+def process_df(df):
+	global GPIO
+	global df_table
+	if is_tx:
+		return False
+	try:
+		df = float(df)
+		leds = None
+		if df > df_table[3]:
+			# light top LED
+			leds = (False, False, True)
+		elif df > df_table[2]:
+			# light center and top LED
+			leds = (False, True, True)
+		elif df < df_table[1]:
+			# light center and bottom LED
+			leds = (True, True, False)
+		elif df < df_table[0]:
+			# light bottom LED
+			leds = (True, False, False)
+		else:
+			# light center LED
+			leds = (False, True, False)
+		if not GPIO:
+			if not is_background:
+				sys.stderr.write("DEBUG: DF = %f: %s\n" % (df, str(leds)))
+			return False
+		for i in range(len(df_table)):
+			if leds[i]:
+				GPIO.output(DF_LEDS[i], DF_LED_ON)
+			else:
+				GPIO.output(DF_LEDS[i], DF_LED_OFF)
+		return True
+	except:
+		return False
+
+
+#
+#  process_clip(...)
+#
+#  Change CLIP LED to reflect new value
+#
+def process_clip(arg):
+	global GPIO
+	try:
+		if not GPIO:
+			if not is_background:
+				sys.stderr.write("DEBUG: CLIP = %s\n" % str(arg))
+			return False
+
+		if arg == '1':
+			GPIO.output(CLIP_LED_PIN, CLIP_LED_ON)
+		elif arg == '0':
+			GPIO.output(CLIP_LED_PIN, CLIP_LED_OFF)
+		return True
+	except:
+		return False
+
+
+#
+#  process_sync(...)
+#
+#  Process the SYNC response
+#
+def process_sync(arg):
+	global is_sync
+	try:
+		is_sync = (arg == '1')
+		if not GPIO:
+			if not is_background:
+				sys.stderr.write("DEBUG: SYNC = %s\n" % arg)
+			return False
+
+		if arg == '1':
+			GPIO.output(SYNC_LED_PIN, SYNC_LED_ON)
+		elif arg == '0':
+			GPIO.output(SYNC_LED_PIN, SYNC_LED_OFF)
+		return True
+	except:
+		return False
+
+
+#
+#  daemonize() - move to the background
+#
+def daemonize():
+	global is_background
+	fpid = os.fork()
+	if fpid > 0:
+		sys.exit(0)
+	is_background = True
+	os.setsid()
+	#os.chdir('/') # won't work with local paths
+	os.umask(0)
+
+
+#
+#  exit_signal(...) - handle shutdown signals
+#
+def exit_signal(signum, frame):
+	global shutdown
+	shutdown = True
+
+
+#
+#  main - entry point of main program
+#
+if __name__ == '__main__':
+	# allocate the mutex
+	mutex = thread.allocate_lock()
+
+	# find the devices
+	alsa_dev = GetALSADeviceNumbers(PCMdevice)
+	if not alsa_dev:
+		sys.stderr.write("FATAL: Could not determine ALSA device number for PCM device: " + PCMdevice + "\n")
+		sys.exit(1)
+
+	rt_dev = GetRTDeviceNumber(PCMdevice)
+	if rt_dev is None:
+		sys.stderr.write("FATAL: Could not find 'fdvcore'\n")
+		sys.exit(1)
+	if rt_dev < 0:
+		sys.stderr.write("FATAL: Could not determine RTAudio device number for PCM device: " + PCMdevice + "\n")
+		sys.exit(1)
+	
+	# signals to catch and EXIT
+	for sig in [ signal.SIGTERM, signal.SIGHUP ]:
+		signal.signal(sig, exit_signal)
+
+	# signals to catch and IGNORE
+	for sig in [ signal.SIGALRM, signal.SIGUSR1, signal.SIGUSR2 ]:
+		signal.signal(sig, signal.SIG_IGN)
+
+	# move to background
+	if not '-f' in sys.argv:
+		sys.stderr.write("DEBUG: Moving to background...\n")
+		daemonize()
+	
+	try:
+		# configure GPIO
+		if GPIO:
+			# start the GPIO module
+			GPIO.setmode(SMALLDV_GPIO_CONVENTION)
+
+			# configure PTT output
+			GPIO.setup(PTT_OUT_PIN, GPIO.OUT)
+			GPIO.output(PTT_OUT_PIN, PTT_OUT_RX) # default to RX mode
+
+			# configure CLIP LED
+			GPIO.setup(CLIP_LED_PIN, GPIO.OUT)
+			GPIO.output(CLIP_LED_PIN, CLIP_LED_ON)  # blink on
+			time.sleep(LED_SETUP_DELAY)             # wait a few msec
+			GPIO.output(CLIP_LED_PIN, CLIP_LED_OFF) # blink off
+
+			# configure SYNC LED
+			GPIO.setup(SYNC_LED_PIN, GPIO.OUT)
+			GPIO.output(SYNC_LED_PIN, SYNC_LED_ON)  # blink on
+			time.sleep(LED_SETUP_DELAY)             # wait a few msec
+			GPIO.output(SYNC_LED_PIN, SYNC_LED_OFF) # blink off
+
+			# configure tuning indicator LEDs
+			for i in range(len(DF_LEDS)):
+				GPIO.setup(DF_LEDS[i], GPIO.OUT)
+				GPIO.output(DF_LEDS[i], DF_LED_ON)  # blink on
+				time.sleep(LED_SETUP_DELAY)         # wait a few msec
+				GPIO.output(DF_LEDS[i], DF_LED_OFF) # blink off
+
+			# configure PTT input
+			GPIO.setup(PTT_IN_PIN, GPIO.IN, GPIO.PUD_UP)
+			GPIO.add_event_detect(PTT_IN_PIN, GPIO.BOTH, HandlePTT)
+
+		# start the socket listener
+		while not listener:
+			try:
+				listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+				listener.bind(("localhost", TCPPort))
+				listener.listen(5)
+				if not is_background:
+					sys.stderr.write("DEBUG: Listening for TCP on localhost:%d\n" % TCPPort)
+			except KeyboardInterrupt as ex:
+				sys.exit(2)
+			except Exception as ex:
+				if not is_background:
+					sys.stderr.write("Could not open server socket: %s, retrying...\n" % ex)
+				listener = None
+				time.sleep(1)
+
+		# read the persisted configuration file
+		config = read_config_file()
+		if config:
+			# read the modem type from the file
+			if 'modem' in config.keys():
+				modem = config['modem']
+				if modem == '1600' or modem == '700' or modem == '700B' or modem == '700C' or modem == '700D' or modem == '800XA':
+					DVmodem = modem
+					if not is_background:
+						sys.stderr.write("DEBUG: Modem type found: %s\n" % modem)
+			else:
+				if not is_background:
+					sys.stderr.write("WARNING: Modem type not found in configuration\n")
+		else: # if there was none, make a new one
+			config = read_modem_config()
+			write_config_file(config)
+			if not is_background:
+				sys.stderr.write("DEBUG: Created new configuration file from modem settings\n")
+
+		# start the modem
+		if not start_fdvcore(rt_dev[0]):
+			if not is_background:
+				sys.stderr.write("WARNING: could not start fdvcore\n")
+			sys.exit(3)
+
+		# start the mixer
+		if not start_amixer():
+			if not is_background:
+				sys.stderr.write("WARNING: could not start amixer\n")
+			sys.exit(4)
+
+		# restore persistent configuration
+		if config:
+			if write_modem_config(config):
+				if not is_background:
+					sys.stderr.write("DEBUG: Updated modem settings from configuration file\n")
+			else:
+				if not is_background:
+					sys.stderr.write("DEBUG: Could not configure modem settings\n")
+
+		# make sure we are in RX mode
+		tx(False, True)
+
+		# socket loop
+		while True:
+			# wait for new connections
+			if listener:
+				rset = [ listener ]
+			try:
+				r, w, e = select.select(rset, [], [], state_poll_delay)
+			except select.error, ex:
+				if ex.args and ex.args[0] == 4:
+					continue # interrupted call is OK; just try again
+				break # otherwise, quit
+
+			# if time to shut down, do that
+			if shutdown:
+				break
+
+			#
+			#  POLL core state
+			#
+			now = time.time();
+			if now - last_poll_time > state_poll_delay:
+				last_poll_time = now
+
+				if last_poll_code == 0:
+					# clip testing
+					response = send_command("CLIP")
+					if response:
+						cmd, arg = split_command(response)
+						process_clip(arg)
+				elif last_poll_code == 1:
+					# frequency offset
+					if not is_tx:
+						response = send_command("DF")
+						if response:
+							cmd, arg = split_command(response)
+							process_df(arg)
+				elif last_poll_code == 2:
+					# synchronized flag
+					if not is_tx:
+						response = send_command("SYNC")
+						if response:
+							cmd, arg = split_command(response)
+							process_sync(arg)
+
+				# move to next poll code
+				last_poll_code = (last_poll_code + 1) % 3
+
+			# check the heath of the 'fdvcore' child process
+			if not disable_fdvcore_checks and not check_fdvcore():
+				stop_fdvcore()
+				if not is_background:
+					sys.stderr.write("WARNING: attempting restart of fdvcore\n")
+				if not start_fdvcore(rt_dev[0]):
+					if not is_background:
+						sys.stderr.write("WARNING: could not start fdvcore\n")
+
+			# check the heath of the 'amixer' child process
+			if not check_amixer():
+				stop_amixer()
+				if not is_background:
+					sys.stderr.write("WARNING: attempting restart of amixer\n")
+				if not start_amixer():
+					if not is_background:
+						sys.stderr.write("WARNING: could not start amixer\n")
+
+			# service new connections
+			if (r):
+				# ...accept the new connection
+				(client, address) = listener.accept()
+				try:
+					mutex.acquire()
+					clients.append(client)
+				finally:
+					mutex.release()
+
+				# start a new service thread
+				thread.start_new_thread(client_thread, (client, address))
+
+	except socket.error, ki:
+		pass # absorb socket exceptions
+	except KeyboardInterrupt, ki:
+		pass # absorb Ctrl-C
+
+	finally:
+		# DEBUG
+		if not is_background:
+			sys.stderr.write("DEBUG: shutting down...\n")
+
+		# go to RX mode
+		tx(False)
+
+		# mute the device
+		send_command("MODE=MUTE")
+
+		# stop the modem
+		stop_fdvcore()
+
+		# stop the socket server
+		stop_server()
+
+		# GPIO shutdown
+		if GPIO:
+			try:
+				GPIO.output(CLIP_LED_PIN, CLIP_LED_OFF)
+				GPIO.output(SYNC_LED_PIN, SYNC_LED_OFF)
+				for i in range(len(DF_LEDS)):
+					GPIO.output(DF_LEDS[i], DF_LED_OFF)
+			except:
+				pass
+
+			# close GPIO library
+			GPIO.cleanup()
+
+# EOF

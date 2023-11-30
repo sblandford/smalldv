@@ -1,0 +1,15 @@
+#
+#  TODO lists
+#
+
+'smalldv' Python script:
+    * Add a momentary button input, which while pushed, will momentarily
+      place the modem in "pass-thru" mode.
+    * Make the PCM device selectable through the TCP interface.
+    * Make the PCM channels selectable through the TCP interface.
+    * Make sure to write (and sync) the config file after each change
+      in current settings (e.g., volume, modem, fdvcore settings, etc.)
+    * Use the SYNC flag from the core to mute tuning indicator when there
+      is no signal to measure
+
+# EOF
