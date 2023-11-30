@@ -103,10 +103,10 @@ int main(int argc, char **argv) {
 	const int modemIndex = 2;
 	if (!strcmp(argv[modemIndex],"1600"))
 		modem = FREEDV_MODE_1600;
-	if (!strcmp(argv[modemIndex],"700"))
+/*	if (!strcmp(argv[modemIndex],"700"))
 		modem = FREEDV_MODE_700;
 	if (!strcmp(argv[modemIndex],"700B"))
-		modem = FREEDV_MODE_700B;
+		modem = FREEDV_MODE_700B; */
 	if (!strcmp(argv[modemIndex],"700C"))
 		modem = FREEDV_MODE_700C;
 	#ifdef FREEDV_MODE_700D

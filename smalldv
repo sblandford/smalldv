@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 #   smalldv
 #
@@ -101,8 +101,8 @@ import select
 import string
 import signal
 import subprocess
-import thread
-import ConfigParser
+import _thread
+import configparser
 
 # import GPIO support on RasPi
 try:
@@ -196,7 +196,7 @@ def start_amixer():
 			bufsize=256,
 			close_fds=True)
 		return True
-	except Exception, e:
+	except (Exception, e):
 		if not is_background:
 			sys.stderr.write("DEBUG: %s: %s\n", str(type(e)), e)
 		return False
@@ -249,7 +249,7 @@ def amixer_set(item, value, quote = False):
 		cmd = "set %s%s%s %s\n" % (quotes, item, quotes, value)
 		amixer.stdin.write(cmd)
 		amixer.stdin.flush()
-	except Exception, e:
+	except (Exception, e):
 		if not is_background:
 			sys.stderr.write("DEBUG: %s: %s\n" % (str(type(e)), e))
 		return False
@@ -307,7 +307,7 @@ def start_fdvcore(dev):
 			stderr=open(os.devnull, 'w'), # comment out to see fdvcore debugging info
 			close_fds=True)
 		return True
-	except Exception, e:
+	except (Exception, e):
 		if not is_background:
 			sys.stderr.write("DEBUG: start_fdvcore(...) failed: %s\n" % (e))
 		fdvcore = None
@@ -521,7 +521,7 @@ def write_modem_config(config):
 		volume.mic = int(config['volume_mic'])
 		update_volume()
 		return True
-	except Exception, ex:
+	except (Exception, ex):
 		if not is_background:
 			sys.stderr.write("DEBUG: write_modem_config(...): " + str(ex) + "\n")
 		return False
@@ -569,7 +569,7 @@ def read_config_file():
 		for pair in config.items('Modem'):
 			result[pair[0]] = pair[1]
 		return result
-	except Exception, ex:
+	except (Exception, ex):
 		if not is_background:
 			sys.stderr.write("read_config_file: " + str(ex) + "\n")
 		return None
@@ -596,7 +596,7 @@ def write_config_file(data):
 		with open(fn, 'w') as configfile:
 			config.write(configfile)
 		return True
-	except Exception, ex:
+	except (Exception, ex):
 		if not is_background:
 			sys.stderr.write("write_config_file: " + str(ex) + "\n")
 		return False
@@ -642,7 +642,7 @@ def client_close(client):
 #
 #  client_thread(...)
 #
-#  The client thread method; this is called once per client on an independent thread.
+#  The client thread method; this is called once per client on an independent _thread.
 #
 def client_thread(client, addr):
 	global clients
@@ -668,7 +668,7 @@ def client_thread(client, addr):
 			# call select to wait for I/O
 			try:
 				(r, w, e) = select.select(rset, wset, []);
-			except select.error, ex:
+			except (select.error, ex):
 				if ex.args and ex.args[0] == 4:
 					continue # interrupted call is OK; just try again
 				break # otherwise, quit
@@ -887,7 +887,7 @@ def update_volume():
 		else:
 			amixer_set(mixer_mic[0], str(volume.radio_rx) + '%', mixer_mic[1])
 			amixer_set(mixer_phones[0], str(volume.phones) + '%', mixer_phones[1])
-	except Exception, ex:
+	except (Exception, ex):
 		if not is_background:
 			sys.stderr.write("DEBUG: update_volume(): %s, %s\n" % (type(ex), ex))
 
@@ -1029,7 +1029,7 @@ def exit_signal(signum, frame):
 #
 if __name__ == '__main__':
 	# allocate the mutex
-	mutex = thread.allocate_lock()
+	mutex = _thread.allocate_lock()
 
 	# find the devices
 	alsa_dev = GetALSADeviceNumbers(PCMdevice)
@@ -1157,7 +1157,7 @@ if __name__ == '__main__':
 				rset = [ listener ]
 			try:
 				r, w, e = select.select(rset, [], [], state_poll_delay)
-			except select.error, ex:
+			except (select.error, ex):
 				if ex.args and ex.args[0] == 4:
 					continue # interrupted call is OK; just try again
 				break # otherwise, quit
@@ -1226,11 +1226,11 @@ if __name__ == '__main__':
 					mutex.release()
 
 				# start a new service thread
-				thread.start_new_thread(client_thread, (client, address))
+				_thread.start_new_thread(client_thread, (client, address))
 
-	except socket.error, ki:
+	except (socket.error, ki):
 		pass # absorb socket exceptions
-	except KeyboardInterrupt, ki:
+	except (KeyboardInterrupt, ki):
 		pass # absorb Ctrl-C
 
 	finally:
